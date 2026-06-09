@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT);
+CREATE TABLE IF NOT EXISTS sessions (id SERIAL PRIMARY KEY, user_id INTEGER, refresh_token_hash TEXT, expires_at TIMESTAMP, revoked_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS seats (id SERIAL PRIMARY KEY, status TEXT DEFAULT 'AVAILABLE');
+CREATE TABLE IF NOT EXISTS saga_logs (transaction_id SERIAL PRIMARY KEY, user_id INTEGER, seat_id INTEGER, status TEXT, step_history TEXT[]);
+INSERT INTO seats (id) VALUES (1), (2), (3) ON CONFLICT DO NOTHING;

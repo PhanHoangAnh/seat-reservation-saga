@@ -1,0 +1,60 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: saga_admin
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_DB: seat_reservation_system
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saga_admin -d seat_reservation_system"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  auth:
+    build: ./auth-service
+    ports: ["3001:3001"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+      JWT_SECRET: super_secret_key_123
+
+  reservation:
+    build: ./reservation-service
+    ports: ["3002:3002"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+
+  payment:
+    build: ./payment-service
+    ports: ["3003:3003"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+
+  api-gateway:
+    build: ./api-gateway
+    ports: ["3000:3000"]
+    depends_on:
+      db:
+        condition: service_healthy
+      auth:
+        condition: service_started
+      reservation:
+        condition: service_started
+      payment:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+      AUTH_SVC: http://auth:3001
+      RES_SVC: http://reservation:3002
+      PAY_SVC: http://payment:3003
