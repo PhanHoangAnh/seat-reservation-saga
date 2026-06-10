@@ -13,13 +13,25 @@ server.get('/seats', async () => {
   const res = await pool.query('SELECT id, seat_number, status, held_until FROM public.seats ORDER BY seat_number ASC');
   return { seats: res.rows };
 });
+
 server.post('/seats/:id/hold', async (request, reply) => {
   const { id } = request.params as any;
   const { userId } = request.body as any;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const seatRes = await client.query('SELECT status FROM public.seats WHERE id = $1 FOR UPDATE', [id]);
+    
+    // Concurrency Fix: FOR UPDATE NOWAIT prevents connection pool exhaustion
+    let seatRes;
+    try {
+      seatRes = await client.query('SELECT status FROM public.seats WHERE id = $1 FOR UPDATE NOWAIT', [id]);
+    } catch (lockErr: any) {
+      if (lockErr.code === '55P03') { // 55P03 = lock_not_available
+        await client.query('ROLLBACK');
+        return reply.status(409).send({ error: 'SEAT_LOCKED_BY_ANOTHER_USER' });
+      }
+      throw lockErr;
+    }
     
     if (seatRes.rowCount === 0) { await client.query('ROLLBACK'); return reply.status(404).send({ error: 'Not found' }); }
     if (seatRes.rows[0].status !== 'AVAILABLE') { await client.query('ROLLBACK'); return reply.status(409).send({ error: 'UNAVAILABLE' }); }
@@ -27,8 +39,14 @@ server.post('/seats/:id/hold', async (request, reply) => {
     await client.query(`UPDATE public.seats SET status = 'HELD', held_by_user_id = $1, held_until = NOW() + INTERVAL '10 minutes' WHERE id = $2`, [userId, id]);
     await client.query('COMMIT');
     return { status: 'HELD', seatId: id };
-  } catch (err) { await client.query('ROLLBACK'); throw err; } finally { client.release(); }
+  } catch (err) { 
+    await client.query('ROLLBACK'); 
+    throw err; 
+  } finally { 
+    client.release(); 
+  }
 });
+
 server.post('/seats/:id/reserve', async (request, reply) => {
   const { id } = request.params as any; const { userId } = request.body as any;
   const res = await pool.query(`UPDATE public.seats SET status = 'RESERVED', reserved_by_user_id = $1, reserved_at = NOW(), held_by_user_id = NULL, held_until = NULL WHERE id = $2 AND status = 'HELD' AND held_by_user_id = $3 RETURNING id`, [userId, id, userId]);

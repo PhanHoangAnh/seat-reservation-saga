@@ -3,24 +3,42 @@ import fastify from 'fastify';
 import { Pool } from 'pg';
 import axios from 'axios';
 import cors from '@fastify/cors';
+import crypto from 'crypto';
 
 const server = fastify({ logger: { level: 'info', transport: { target: 'pino-pretty', options: { ignore: 'pid,hostname' } } } });
-server.register(cors, { origin: '*' });
+
+server.register(cors, { origin: process.env.CORS_ORIGIN || 'http://localhost:3000' });
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const AUTH_SVC = process.env.AUTH_SVC || 'http://127.0.0.1:3001';
 const RES_SVC = process.env.RES_SVC || 'http://127.0.0.1:3002';
 const PAY_SVC = process.env.PAY_SVC || 'http://127.0.0.1:3003';
+const CALLBACK_SECRET = process.env.PAYMENT_CALLBACK_SECRET || 'super_secret_callback_key_123';
+
+// Phase 4, Step 9: In-Memory JWT Cache to prevent /verify spam
+const VERIFY_CACHE = new Map<string, { userId: string; exp: number }>();
 
 server.addHook('preHandler', async (request, reply) => {
-  if (request.url.startsWith('/api/')) {
-    // Skip auth for GET /api/seats AND the callback route
-    if ((request.method !== 'GET' || request.url !== '/api/seats') && request.url !== '/api/payments/callback') {
-      try {
-        const authRes = await axios.get(`${AUTH_SVC}/verify`, { headers: { authorization: request.headers.authorization } });
-        (request as any).user = authRes.data.user;
-      } catch (err) { return reply.status(401).send({ error: 'Unauthorized' }); }
+  if (request.url.startsWith('/api/') && request.url !== '/api/seats' && request.url !== '/api/payments/callback') {
+    const authHeader = request.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return reply.status(401).send({ error: 'Unauthorized' });
+    
+    const token = authHeader.split(' ')[1];
+    const key = crypto.createHash('sha256').update(token).digest('hex');
+    const cached = VERIFY_CACHE.get(key);
+    
+    if (cached && cached.exp > Date.now() / 1000) {
+      (request as any).user = cached;
+      return;
     }
+
+    try {
+      const authRes = await axios.get(`${AUTH_SVC}/verify`, { headers: { authorization: authHeader } });
+      const user = authRes.data.user;
+      VERIFY_CACHE.set(key, { userId: user.userId, exp: user.exp });
+      setTimeout(() => VERIFY_CACHE.delete(key), 30_000); // TTL 30s
+      (request as any).user = user;
+    } catch (err) { return reply.status(401).send({ error: 'Unauthorized' }); }
   }
 });
 
@@ -29,23 +47,27 @@ server.get('/api/seats', async () => {
   return res.data;
 });
 
-server.post('/api/book', async (request, reply) => {
-  const { seatId } = request.body as any;
-  const userId = (request as any).user.userId;
+// Phase 3: Eradicate `any` with Schema Validation
+const bookSchema = {
+  body: {
+    type: 'object',
+    required: ['seatId'],
+    properties: { seatId: { type: 'integer' } },
+    additionalProperties: false
+  }
+};
 
+interface BookBody { seatId: number; }
+
+server.post<{ Body: BookBody }>('/api/book', { schema: bookSchema }, async (request, reply) => {
+  const { seatId } = request.body; // Fully typed, no 'as any'
+  const userId = (request as any).user.userId;
 
   const sagaRes = await pool.query(`INSERT INTO saga_logs (user_id, seat_id, status) VALUES ($1, $2, 'PENDING') RETURNING transaction_id`, [userId, seatId]);
   const transactionId = sagaRes.rows[0].transaction_id;
-  
-  
-    
-  
 
   try {
-    // FAIL TEST: Simulate payment failure
-    if (seatId === 999) {
-      throw new Error('SIMULATED_PAYMENT_FAILURE');
-    }
+    if (seatId === 999) throw new Error('SIMULATED_PAYMENT_FAILURE');
 
     await pool.query(`UPDATE saga_logs SET step_history = array_append(step_history, 'HOLDING_SEAT') WHERE transaction_id = $1`, [transactionId]);
     await axios.post(`${RES_SVC}/seats/${seatId}/hold`, { userId });
@@ -63,11 +85,18 @@ server.post('/api/book', async (request, reply) => {
 });
 
 server.post('/api/payments/callback', async (request, reply) => {
-  const { transactionId, status } = request.body as any;
+  const authSecret = request.headers['x-callback-secret'] as string;
+  if (!authSecret) return reply.status(401).send({ error: 'Unauthorized callback' });
 
-  if (status !== 'SUCCESS') {
-    return reply.status(400).send({ error: 'Payment failed' });
+  const expectedBuffer = Buffer.from(CALLBACK_SECRET);
+  const providedBuffer = Buffer.from(authSecret);
+
+  if (expectedBuffer.length !== providedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+    return reply.status(401).send({ error: 'Unauthorized callback' });
   }
+
+  const { transactionId, status } = request.body as any;
+  if (status !== 'SUCCESS') return reply.status(400).send({ error: 'Payment failed' });
 
   const sagaRes = await pool.query('SELECT seat_id, user_id FROM saga_logs WHERE transaction_id = $1', [transactionId]);
   if (sagaRes.rowCount === 0) return reply.status(404).send({ error: 'Transaction not found' });
