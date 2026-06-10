@@ -113,10 +113,74 @@ server.post('/api/payments/callback', async (request, reply) => {
   }
 });
 
+// ASYNC SAGA RECOVERY JOB DAE MOND
+async function startSagaRecovery(): Promise<void> {
+  setInterval(async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Find sagas stuck in PENDING for more than 5 minutes
+      const { rows } = await client.query<{
+        transaction_id: number; seat_id: number; user_id: number
+      }>(
+        `SELECT transaction_id, seat_id, user_id FROM saga_logs
+         WHERE status = 'PENDING'
+           AND created_at < NOW() - INTERVAL '5 minutes'
+         LIMIT 20
+         FOR UPDATE SKIP LOCKED`
+      );
+
+      for (const saga of rows) {
+        let paymentSucceeded = false;
+        try {
+          const payRes = await axios.get(`${PAY_SVC}/payments/status/${saga.transaction_id}`);
+          paymentSucceeded = payRes.data?.status === 'COMPLETED';
+        } catch (err) {
+          // If payment service status route fails or is unreachable, skip execution for this tick
+          continue;
+        }
+
+        if (paymentSucceeded) {
+          // Payment succeeded but callback dropped out -> Complete Saga
+          await client.query(
+            `UPDATE saga_logs SET status = 'COMPLETED',
+             step_history = array_append(step_history, 'RECOVERED_BY_JOB')
+             WHERE transaction_id = $1`,
+            [saga.transaction_id]
+          );
+          await axios.post(`${RES_SVC}/seats/${saga.seat_id}/reserve`, { userId: saga.user_id });
+        } else {
+          // Payment dropped or failed -> Roll back seat hold
+          await client.query(
+            `UPDATE saga_logs SET status = 'FAILED',
+             step_history = array_append(step_history, 'EXPIRED_BY_RECOVERY_JOB')
+             WHERE transaction_id = $1`,
+            [saga.transaction_id]
+          );
+          try {
+            await axios.post(`${RES_SVC}/seats/${saga.seat_id}/release`, { userId: saga.user_id });
+          } catch (e) {
+            server.log.error(`Failed to execute compensation release for seat ${saga.seat_id}`);
+          }
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      server.log.error(err, 'Saga recovery tick encountered an exception');
+    } finally {
+      client.release();
+    }
+  }, 60000); // Run reconciler daemon loop every 60 seconds
+}
+
 const start = async () => {
   try {
     const port = parseInt(process.env.PORT || '3000', 10);
     await server.listen({ port, host: '0.0.0.0' });
+    startSagaRecovery(); // Fire up recovery daemon loop on start
   } catch (err) { server.log.error(err); process.exit(1); }
 };
 start();

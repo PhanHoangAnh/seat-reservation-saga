@@ -2,10 +2,14 @@ import 'dotenv/config';
 import fastify from 'fastify';
 import { Pool } from 'pg';
 import PgBoss from 'pg-boss';
+import { sseRoutes, seatUpdatesBus } from './routes/sse.js';
 
 const server = fastify({ logger: { level: 'info', transport: { target: 'pino-pretty', options: { ignore: 'pid,hostname' } } } });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const boss = new PgBoss(process.env.DATABASE_URL!);
+
+// Register the SSE streaming engine plugin matrix
+server.register(sseRoutes);
 
 boss.on('error', error => server.log.error(error));
 
@@ -21,12 +25,11 @@ server.post('/seats/:id/hold', async (request, reply) => {
   try {
     await client.query('BEGIN');
     
-    // Concurrency Fix: FOR UPDATE NOWAIT prevents connection pool exhaustion
     let seatRes;
     try {
       seatRes = await client.query('SELECT status FROM public.seats WHERE id = $1 FOR UPDATE NOWAIT', [id]);
     } catch (lockErr: any) {
-      if (lockErr.code === '55P03') { // 55P03 = lock_not_available
+      if (lockErr.code === '55P03') {
         await client.query('ROLLBACK');
         return reply.status(409).send({ error: 'SEAT_LOCKED_BY_ANOTHER_USER' });
       }
@@ -38,6 +41,10 @@ server.post('/seats/:id/hold', async (request, reply) => {
     
     await client.query(`UPDATE public.seats SET status = 'HELD', held_by_user_id = $1, held_until = NOW() + INTERVAL '10 minutes' WHERE id = $2`, [userId, id]);
     await client.query('COMMIT');
+
+    // Broadcast the real-time event notice down open stream channels
+    seatUpdatesBus.emit('update', { seatId: id, status: 'HELD' });
+
     return { status: 'HELD', seatId: id };
   } catch (err) { 
     await client.query('ROLLBACK'); 
@@ -51,12 +58,22 @@ server.post('/seats/:id/reserve', async (request, reply) => {
   const { id } = request.params as any; const { userId } = request.body as any;
   const res = await pool.query(`UPDATE public.seats SET status = 'RESERVED', reserved_by_user_id = $1, reserved_at = NOW(), held_by_user_id = NULL, held_until = NULL WHERE id = $2 AND status = 'HELD' AND held_by_user_id = $3 RETURNING id`, [userId, id, userId]);
   if ((res.rowCount ?? 0) === 0) return reply.status(400).send({ error: 'Cannot reserve' });
+
+  // Broadcast real-time permanent reservation event
+  seatUpdatesBus.emit('update', { seatId: id, status: 'RESERVED' });
+
   return { status: 'RESERVED', seatId: id };
 });
 
 server.post('/seats/:id/release', async (request, reply) => {
   const { id } = request.params as any; const { userId } = request.body as any;
   const res = await pool.query(`UPDATE public.seats SET status = 'AVAILABLE', held_by_user_id = NULL, held_until = NULL WHERE id = $2 AND status = 'HELD' AND held_by_user_id = $1 RETURNING id`, [userId, id]);
+  
+  if ((res.rowCount ?? 0) > 0) {
+    // Broadcast manual release transition state out to channels
+    seatUpdatesBus.emit('update', { seatId: id, status: 'AVAILABLE' });
+  }
+
   return { status: 'AVAILABLE', seatId: id, released: (res.rowCount ?? 0) > 0 };
 });
 
@@ -67,8 +84,18 @@ const start = async () => {
     await boss.createQueue('cleanup-expired-holds');
     await boss.schedule('cleanup-expired-holds', '*/2 * * * *'); 
     await boss.work('cleanup-expired-holds', async () => {
+      // Find rows that are about to drop to emit accurate data frames
+      const targetHolds = await pool.query(`SELECT id FROM public.seats WHERE status = 'HELD' AND held_until < NOW()`);
+      
       const res = await pool.query(`UPDATE public.seats SET status = 'AVAILABLE', held_by_user_id = NULL, held_until = NULL WHERE status = 'HELD' AND held_until < NOW()`);
-      if ((res.rowCount ?? 0) > 0) server.log.info(`Released ${(res.rowCount ?? 0)} expired seat holds.`);
+      
+      if ((res.rowCount ?? 0) > 0) {
+        server.log.info(`Released ${(res.rowCount ?? 0)} expired seat holds.`);
+        // Emit notices for every background drop cycle
+        for (const row of targetHolds.rows) {
+          seatUpdatesBus.emit('update', { seatId: row.id, status: 'AVAILABLE' });
+        }
+      }
     });
     await server.listen({ port, host: '0.0.0.0' });
   } catch (err) { server.log.error(err); process.exit(1); }

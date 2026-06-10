@@ -1,0 +1,19 @@
+services:
+  auth:
+    environment:
+      - REDIS_URL=redis://redis:6379
+
+  payment:
+    environment:
+      - WEBHOOK_SECRET=whsec_mock_secret_value_123
+      - PAYMENT_CALLBACK_SECRET=super_secret_callback_key_123
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
