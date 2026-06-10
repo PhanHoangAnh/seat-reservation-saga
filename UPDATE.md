@@ -1,6 +1,6 @@
 # Security & Architecture Remediation Report
 
-This document outlines the critical vulnerabilities identified in the initial assessment (Score: ~3.5/10) and the engineering solutions implemented to upgrade the system to a production-ready state.
+This document outlines the critical vulnerabilities identified in the initial assessment and the engineering solutions implemented to upgrade the system to a production-ready state.
 
 ## 1. Authentication & Cryptography (Critical Fixes)
 * **Problem:** Passwords were hashed using SHA-256, which is vulnerable to rapid GPU brute-force attacks.
