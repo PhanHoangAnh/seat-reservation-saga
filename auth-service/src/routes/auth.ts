@@ -36,7 +36,6 @@ interface AuthBody {
   password: string;
 }
 
-// High-performance token version Cache-Aside fetching helper
 async function getUserTokenVersion(userId: number): Promise<number> {
   const cacheKey = `user:${userId}:ver`;
   const cachedVer = await redis.get(cacheKey);
@@ -48,8 +47,7 @@ async function getUserTokenVersion(userId: number): Promise<number> {
   const res = await pool.query('SELECT token_version FROM users WHERE id = $1', [userId]);
   const dbVer = res.rows[0]?.token_version ?? 0;
   
-  // Cache the version constraint state locally for 1 hour
-  await redis.set(cacheKey, dbVer, 'EX', 3600);
+  await redis.set(cacheKey, dbVer, 'EX', 30);
   return dbVer;
 }
 
@@ -80,7 +78,16 @@ export async function authRoutes(server: FastifyInstance) {
 
     if (!isValid) return reply.status(401).send({ error: 'Invalid credentials' });
 
-    const accessToken = jwt.sign({ userId, ver: token_version }, JWT_SECRET, { expiresIn: '15m' });
+    await pool.query(
+      'UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()',
+      [userId]
+    );
+    await pool.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [userId]);
+    await redis.del(`user:${userId}:ver`);
+    
+    const currentVersion = token_version + 1;
+
+    const accessToken = jwt.sign({ userId, ver: currentVersion }, JWT_SECRET, { expiresIn: '15m' });
     const refreshToken = crypto.randomBytes(40).toString('hex');
     const refreshTokenHash = hashToken(refreshToken);
     
@@ -89,8 +96,7 @@ export async function authRoutes(server: FastifyInstance) {
       [userId, refreshTokenHash]
     );
 
-    // Warm up the cache instantly upon successful login
-    await redis.set(`user:${userId}:ver`, token_version, 'EX', 3600);
+    await redis.set(`user:${userId}:ver`, currentVersion, 'EX', 30);
     
     return reply
       .setCookie('refreshToken', refreshToken, {
@@ -135,8 +141,7 @@ export async function authRoutes(server: FastifyInstance) {
       );
       await client.query('COMMIT');
 
-      // Update cache version to prevent unexpected verification drops
-      await redis.set(`user:${userId}:ver`, tokenVersion, 'EX', 3600);
+      await redis.set(`user:${userId}:ver`, tokenVersion, 'EX', 30);
 
       return reply
         .setCookie('refreshToken', newRefreshToken, {
@@ -166,12 +171,28 @@ export async function authRoutes(server: FastifyInstance) {
       if ((res.rowCount ?? 0) > 0) {
         const userId = res.rows[0].user_id;
         await pool.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [userId]);
-        
-        // Evict key immediately from Redis cache upon explicit revocation
         await redis.del(`user:${userId}:ver`);
       }
     }
     return reply.clearCookie('refreshToken', { path: '/api/auth' }).send({ status: 'revoked' });
+  });
+
+  server.post('/logout-all', async (request, reply) => {
+    const authHeader = request.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) return reply.status(401).send({ error: 'Unauthorized' });
+    
+    const token = authHeader.split(' ')[1];
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as any;
+      
+      await pool.query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [decoded.userId]);
+      await pool.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [decoded.userId]);
+      await redis.del(`user:${decoded.userId}:ver`);
+      
+      return { status: 'all_revoked' };
+    } catch { 
+      return reply.status(401).send({ error: 'Invalid token' }); 
+    }
   });
 
   server.get('/verify', async (request, reply) => {
@@ -181,7 +202,6 @@ export async function authRoutes(server: FastifyInstance) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as any;
       
-      // Look up current token version using memory cache lookaside helper
       const currentVer = await getUserTokenVersion(decoded.userId);
       if (decoded.ver !== currentVer) {
         return reply.status(401).send({ error: 'Token revoked or expired' });

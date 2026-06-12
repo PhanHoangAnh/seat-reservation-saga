@@ -36,7 +36,8 @@ export async function paymentRoutes(server: FastifyInstance) {
     return { transactionId, status: res.rows[0].status };
   });
 
-  server.post('/payments/webhook', async (request, reply) => {
+  // SEC-06 Fix: Route explicitly configures rawBody extraction to prevent signature corruption
+  server.post('/payments/webhook', { config: { rawBody: true } }, async (request, reply) => {
     const signatureHeader = request.headers['stripe-signature'] as string;
     if (!signatureHeader) return reply.status(401).send({ error: 'Missing signature' });
 
@@ -55,7 +56,9 @@ export async function paymentRoutes(server: FastifyInstance) {
       return reply.status(400).send({ error: 'Webhook timestamp outside tolerance window' });
     }
 
-    const signedPayload = `${sigParts.t}.${JSON.stringify(request.body)}`;
+    // Capture the unparsed wire-buffer for HMAC hashing rather than stringifying an object map
+    const rawBodyBuffer = (request as any).rawBody;
+    const signedPayload = `${sigParts.t}.${rawBodyBuffer}`;
     const expectedSignature = crypto.createHmac('sha256', WEBHOOK_SECRET).update(signedPayload).digest('hex');
 
     const expectedBuffer = Buffer.from(expectedSignature);

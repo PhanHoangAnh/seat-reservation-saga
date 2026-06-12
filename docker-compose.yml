@@ -3,7 +3,7 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: saga_admin
-      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be provided}
       POSTGRES_DB: seat_reservation_system
     ports:
       - "5433:5432"
@@ -12,6 +12,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
   auth:
     build: ./auth-service
@@ -19,9 +31,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
-      JWT_SECRET: super_secret_key_123
+      DATABASE_URL: postgres://saga_admin:${POSTGRES_PASSWORD}@db:5432/seat_reservation_system
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be provided}
+      REDIS_URL: redis://redis:6379
+    restart: unless-stopped
 
   reservation:
     build: ./reservation-service
@@ -30,7 +46,8 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+      DATABASE_URL: postgres://saga_admin:${POSTGRES_PASSWORD}@db:5432/seat_reservation_system
+    restart: unless-stopped
 
   payment:
     build: ./payment-service
@@ -39,7 +56,11 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+      DATABASE_URL: postgres://saga_admin:${POSTGRES_PASSWORD}@db:5432/seat_reservation_system
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET must be provided}
+      PAYMENT_CALLBACK_SECRET: ${PAYMENT_CALLBACK_SECRET:?PAYMENT_CALLBACK_SECRET must be provided}
+      GATEWAY_URL: http://api-gateway:3000
+    restart: unless-stopped
 
   api-gateway:
     build: ./api-gateway
@@ -54,7 +75,27 @@ services:
       payment:
         condition: service_started
     environment:
-      DATABASE_URL: postgres://saga_admin:supersecretpassword@db:5432/seat_reservation_system
+      DATABASE_URL: postgres://saga_admin:${POSTGRES_PASSWORD}@db:5432/seat_reservation_system
       AUTH_SVC: http://auth:3001
       RES_SVC: http://reservation:3002
       PAY_SVC: http://payment:3003
+      PAYMENT_CALLBACK_SECRET: ${PAYMENT_CALLBACK_SECRET:?PAYMENT_CALLBACK_SECRET must be provided}
+      REDIS_URL: redis://redis:6379
+    restart: unless-stopped
+
+  web-client:
+    image: nginx:alpine
+    volumes:
+      - ./web-client/index.html:/usr/share/nginx/html/index.html:ro
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-gateway
+      - web-client
+    restart: unless-stopped
